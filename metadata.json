@@ -1,0 +1,6 @@
+{
+  "name": "OPS FORTUNE",
+  "description": "Connect. Decode. Score. Live operations management competition game app with synchronised projector pyramid display.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
