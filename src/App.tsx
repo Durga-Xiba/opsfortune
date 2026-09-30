@@ -5,32 +5,54 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { GameConfig, GameState, SyncMessage, TimerStatus } from './types/game';
+import { GameConfig, GameState, TimerStatus } from './types/game';
 import {
   getInitialConfig,
   getInitialState,
   saveConfig,
   saveState,
   createFreshState,
-  ChannelSync,
 } from './utils/gameState';
+import {
+  subscribeToGameState,
+  subscribeToGameConfig,
+  subscribeToConnectionHealth,
+  saveGameStateToFirebase,
+  saveGameConfigToFirebase,
+  fetchInitialGameStateFromFirebase,
+  fetchInitialGameConfigFromFirebase,
+} from './utils/firebaseSync';
 import { soundEngine } from './utils/audio';
 import { DEFAULT_QUESTIONS } from './data/defaultQuestions';
 import { HostControl } from './components/HostControl';
 import { ProjectorView } from './components/ProjectorView';
 import { AdminEditor } from './components/AdminEditor';
+import { FirebaseSyncStatus } from './components/FirebaseSyncStatus';
 import { Monitor, Sliders, PlayCircle } from 'lucide-react';
 
 export default function App() {
   const [config, setConfig] = useState<GameConfig>(getInitialConfig);
   const [state, setState] = useState<GameState>(getInitialState);
+  const [isFirebaseConnected, setIsFirebaseConnected] = useState<boolean>(false);
 
-  // In-app tab navigation: 'host' | 'projector' | 'admin'
-  const [activeTab, setActiveTab] = useState<'host' | 'projector' | 'admin'>('host');
+  // Check URL query param ?view=projector (ideal for Median APK on Projector/LED screen)
+  const [activeTab, setActiveTab] = useState<'host' | 'projector' | 'admin'>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('view') === 'projector') {
+          return 'projector';
+        }
+      } catch {
+        // safe
+      }
+    }
+    return 'host';
+  });
 
   const [popupBlockedNotice, setPopupBlockedNotice] = useState<boolean>(false);
 
-  // Reference to external projector window and mount DOM node for React Portal
+  // Reference to external projector window and mount DOM node for desktop browser multi-window
   const projectorWindowRef = useRef<Window | null>(null);
   const [projectorMountNode, setProjectorMountNode] = useState<HTMLElement | null>(null);
 
@@ -41,64 +63,87 @@ export default function App() {
   const configRef = useRef<GameConfig>(config);
   configRef.current = config;
 
-  const channelRef = useRef<ChannelSync | null>(null);
-
-  // Broadcast state helper
-  const broadcastCurrent = useCallback((updatedState: GameState, updatedConfig?: GameConfig) => {
-    saveState(updatedState);
-    if (updatedConfig) {
-      saveConfig(updatedConfig);
-    }
-    if (channelRef.current) {
-      channelRef.current.broadcast({
-        type: 'SYNC_STATE',
-        state: updatedState,
-        config: updatedConfig || configRef.current,
-        timestamp: Date.now(),
-      });
-    }
+  // Authoritative Host state commit: writes to local storage AND pushes to Firebase Realtime Database
+  const commitHostState = useCallback((nextState: GameState) => {
+    setState(nextState);
+    stateRef.current = nextState;
+    saveState(nextState);
+    saveGameStateToFirebase(nextState).catch((err) => {
+      console.warn('Firebase state write fallback to local:', err);
+    });
   }, []);
 
-  // Initialize BroadcastChannel sync
+  // Firebase Realtime Subscriptions (Cross-APK synchronization)
   useEffect(() => {
-    const handleSyncMessage = (msg: SyncMessage) => {
-      if (msg.type === 'SYNC_STATE') {
-        if (msg.config) {
-          setConfig(msg.config);
-          configRef.current = msg.config;
+    let unsubState: (() => void) | null = null;
+    let unsubConfig: (() => void) | null = null;
+    let unsubHealth: (() => void) | null = null;
+
+    // 1. Connection health monitoring
+    unsubHealth = subscribeToConnectionHealth((connected) => {
+      setIsFirebaseConnected(connected);
+    });
+
+    // 2. Fetch initial state & config on startup / crash recovery
+    const initBootstrap = async () => {
+      try {
+        const remoteState = await fetchInitialGameStateFromFirebase();
+        if (remoteState) {
+          setState(remoteState);
+          stateRef.current = remoteState;
+          saveState(remoteState);
+        } else if (activeTab === 'host') {
+          // If no remote state exists in Firebase yet, Host seeds the initial state
+          saveGameStateToFirebase(stateRef.current).catch(() => {});
         }
-        if (msg.state) {
-          setState(msg.state);
-          stateRef.current = msg.state;
+
+        const remoteConfig = await fetchInitialGameConfigFromFirebase();
+        if (remoteConfig) {
+          setConfig(remoteConfig);
+          configRef.current = remoteConfig;
+          saveConfig(remoteConfig);
+        } else if (activeTab === 'host') {
+          saveGameConfigToFirebase(configRef.current).catch(() => {});
         }
-      } else if (msg.type === 'REQUEST_STATE') {
-        // Reply with current state
-        if (channelRef.current) {
-          channelRef.current.broadcast({
-            type: 'SYNC_STATE',
-            state: stateRef.current,
-            config: configRef.current,
-            timestamp: Date.now(),
-          });
-        }
+      } catch (e) {
+        console.warn('Bootstrap fetch error, using local state:', e);
       }
     };
 
-    const sync = new ChannelSync(handleSyncMessage);
-    channelRef.current = sync;
+    initBootstrap();
 
-    // Send initial request in case another tab (host) has state
-    sync.broadcast({
-      type: 'REQUEST_STATE',
-      timestamp: Date.now(),
+    // 3. Realtime listener for game state from Firebase
+    unsubState = subscribeToGameState((incomingState) => {
+      setState((prev) => {
+        // Trigger wrong guess audio if an incoming update recorded a new wrong guess
+        if (
+          incomingState.lastWrongGuessTimestamp &&
+          incomingState.lastWrongGuessTimestamp !== prev.lastWrongGuessTimestamp
+        ) {
+          soundEngine.playWrongGuessSound();
+        }
+        return incomingState;
+      });
+      stateRef.current = incomingState;
+      saveState(incomingState);
+    });
+
+    // 4. Realtime listener for game config from Firebase
+    unsubConfig = subscribeToGameConfig((incomingConfig) => {
+      setConfig(incomingConfig);
+      configRef.current = incomingConfig;
+      saveConfig(incomingConfig);
     });
 
     return () => {
-      sync.destroy();
+      if (unsubState) unsubState();
+      if (unsubConfig) unsubConfig();
+      if (unsubHealth) unsubHealth();
     };
-  }, []);
+  }, [activeTab]);
 
   // High-frequency Authoritative Timer Tick
+  // Both Host and Projector calculate remaining time from the same timerEndTime
   useEffect(() => {
     const interval = setInterval(() => {
       const currentState = stateRef.current;
@@ -109,12 +154,10 @@ export default function App() {
       const now = Date.now();
       const rawRemaining = Math.max(0, Math.ceil((currentState.timerEndTime - now) / 1000));
 
-      let newStatus: TimerStatus = currentState.timerStatus;
-      let newEndTime: number | null = currentState.timerEndTime;
+      const checkpoints = [110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
       const newBuzzerHistory = [...currentState.buzzerHistory];
 
-      // Check 10-second checkpoints: [110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10]
-      const checkpoints = [110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+      // Check 10-second checkpoints
       for (const cp of checkpoints) {
         if (rawRemaining <= cp && !newBuzzerHistory.includes(cp)) {
           newBuzzerHistory.push(cp);
@@ -122,43 +165,55 @@ export default function App() {
         }
       }
 
-      // Check 00:00 Final Buzzer
+      // Check 00:00 Final Buzzer & Time Up
       if (rawRemaining <= 0) {
-        newStatus = 'TIME_UP';
-        newEndTime = null;
         if (!newBuzzerHistory.includes(0)) {
           newBuzzerHistory.push(0);
           soundEngine.playFinalBuzzer();
         }
+
+        const timeUpState: GameState = {
+          ...currentState,
+          timerRemaining: 0,
+          timerStatus: 'TIME_UP',
+          timerEndTime: null,
+          buzzerHistory: newBuzzerHistory,
+          lastUpdated: Date.now(),
+        };
+
+        setState(timeUpState);
+        stateRef.current = timeUpState;
+        saveState(timeUpState);
+
+        // Host writes TIME_UP authoritatively to Firebase
+        if (activeTab === 'host') {
+          saveGameStateToFirebase(timeUpState).catch(() => {});
+        }
+        return;
       }
 
+      // Smooth local UI countdown without spamming Firebase on every second
       if (
         rawRemaining !== currentState.timerRemaining ||
-        newStatus !== currentState.timerStatus ||
         newBuzzerHistory.length !== currentState.buzzerHistory.length
       ) {
         const nextState: GameState = {
           ...currentState,
           timerRemaining: rawRemaining,
-          timerStatus: newStatus,
-          timerEndTime: newEndTime,
           buzzerHistory: newBuzzerHistory,
-          lastUpdated: Date.now(),
         };
-
         setState(nextState);
-        broadcastCurrent(nextState);
+        stateRef.current = nextState;
       }
-    }, 150);
+    }, 100);
 
     return () => clearInterval(interval);
-  }, [broadcastCurrent]);
+  }, [activeTab]);
 
-  // Host Actions
+  // Host Action Handlers
   const handleStartTimer = () => {
     soundEngine.unlock();
     const currentState = stateRef.current;
-    // Guard: Do not duplicate if already running or if time is up without reset
     if (currentState.timerStatus === 'RUNNING' || currentState.timerRemaining <= 0) {
       return;
     }
@@ -173,8 +228,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handlePauseTimer = () => {
@@ -195,8 +249,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleResetTimer = () => {
@@ -211,8 +264,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleChangeQuestion = (newIndex: number) => {
@@ -240,8 +292,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleWrongGuess = () => {
@@ -263,8 +314,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleUndoWrongGuess = () => {
@@ -282,8 +332,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleRevealAnswer = (answerIndex: number) => {
@@ -291,7 +340,6 @@ export default function App() {
     const qIdx = currentState.currentQuestionIndex;
     const currentRevealed = currentState.revealedMap[qIdx] || Array(10).fill(false);
 
-    // Prevent duplicate accidental click
     if (currentRevealed[answerIndex]) return;
 
     soundEngine.unlock();
@@ -309,8 +357,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleRevealAll = () => {
@@ -329,8 +376,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleHideAll = () => {
@@ -346,8 +392,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleResetQuestion = () => {
@@ -373,30 +418,21 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
-    setState(nextState);
-    broadcastCurrent(nextState);
+    commitHostState(nextState);
   };
 
   const handleResetGameplay = () => {
     const fresh = createFreshState();
-    setState(fresh);
-    broadcastCurrent(fresh);
+    commitHostState(fresh);
   };
 
   const handleSaveConfig = (newConfig: GameConfig) => {
     setConfig(newConfig);
     configRef.current = newConfig;
     saveConfig(newConfig);
-
-    if (channelRef.current) {
-      channelRef.current.broadcast({
-        type: 'SYNC_STATE',
-        state: stateRef.current,
-        config: newConfig,
-        timestamp: Date.now(),
-      });
-    }
-
+    saveGameConfigToFirebase(newConfig).catch((err) => {
+      console.warn('Firebase config write error:', err);
+    });
     setActiveTab('host');
   };
 
@@ -410,21 +446,23 @@ export default function App() {
     setConfig(defaultCfg);
     configRef.current = defaultCfg;
     saveConfig(defaultCfg);
+    saveGameConfigToFirebase(defaultCfg).catch(() => {});
 
     const fresh = createFreshState();
-    setState(fresh);
-    broadcastCurrent(fresh, defaultCfg);
+    commitHostState(fresh);
   };
 
-  // Helper to safely bootstrap DOM inside a same-origin blank window
+  // Helper to safely bootstrap DOM inside a same-origin blank window (Desktop multi-window)
   const initProjectorWindowDOM = useCallback((win: Window): HTMLElement | null => {
     try {
       win.document.title = `${configRef.current.gameName || 'OPS FORTUNE'} · Projector Display`;
-      win.document.body.className = 'bg-[#F8F9FA] text-[#1E293B] antialiased min-h-screen select-none m-0 p-0 overflow-x-hidden';
+      win.document.body.className =
+        'bg-[#F8F9FA] text-[#1E293B] antialiased min-h-screen select-none m-0 p-0 overflow-x-hidden';
       win.document.body.innerHTML = '<div id="projector-mount"></div>';
 
-      // Copy stylesheet & font links from parent document
-      const headNodes = document.querySelectorAll('link[rel="stylesheet"], link[rel="preconnect"], style');
+      const headNodes = document.querySelectorAll(
+        'link[rel="stylesheet"], link[rel="preconnect"], style'
+      );
       headNodes.forEach((node) => {
         try {
           win.document.head.appendChild(node.cloneNode(true));
@@ -440,19 +478,14 @@ export default function App() {
     }
   }, []);
 
-  // Safe window launcher: opens an in-memory same-origin window WITHOUT sending any HTTP request to the server!
-  // This completely eliminates HTTP 403 Forbidden errors.
   const handleOpenProjectorWindow = useCallback(() => {
     try {
-      // If already open and active, simply bring to front
       if (projectorWindowRef.current && !projectorWindowRef.current.closed) {
         projectorWindowRef.current.focus();
         setPopupBlockedNotice(false);
         return;
       }
 
-      // Open a blank window directly inside the user's click event.
-      // Parameter '' or 'about:blank' prevents any server HTTP fetch!
       const win = window.open(
         '',
         'OpsFortuneProjectorWindow',
@@ -472,7 +505,6 @@ export default function App() {
         setProjectorMountNode(mount);
       }
 
-      // Handle window closure
       const handleClose = () => {
         setProjectorMountNode(null);
         projectorWindowRef.current = null;
@@ -488,8 +520,7 @@ export default function App() {
     }
   }, [initProjectorWindowDOM]);
 
-  // Watchdog: monitors external projector window.
-  // If user refreshes the projector window, re-bootstraps it immediately with ZERO HTTP requests.
+  // Watchdog for Desktop browser popups
   useEffect(() => {
     const watchdog = setInterval(() => {
       const win = projectorWindowRef.current;
@@ -504,14 +535,12 @@ export default function App() {
       try {
         const mount = win.document.getElementById('projector-mount');
         if (!mount) {
-          // Window was reloaded: re-bootstrap DOM and mount portal
           const newMount = initProjectorWindowDOM(win);
           if (newMount) {
             setProjectorMountNode(newMount);
           }
         }
       } catch {
-        // Window detached or navigating
         setProjectorMountNode(null);
         projectorWindowRef.current = null;
       }
@@ -519,6 +548,21 @@ export default function App() {
 
     return () => clearInterval(watchdog);
   }, [initProjectorWindowDOM]);
+
+  // Dedicated Projector View route (e.g. for Median APK on Projector or LED Screen)
+  const isDedicatedProjector =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('view') === 'projector';
+
+  if (isDedicatedProjector) {
+    return (
+      <ProjectorView
+        config={config}
+        state={state}
+        isFirebaseConnected={isFirebaseConnected}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#1E293B] flex flex-col justify-between">
@@ -534,44 +578,49 @@ export default function App() {
           </span>
         </div>
 
-        {/* View Switcher Tabs (All rendered client-side on same application origin) */}
-        <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-md border border-slate-200">
-          <button
-            type="button"
-            onClick={() => setActiveTab('host')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-              activeTab === 'host'
-                ? 'bg-white text-slate-900 shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <PlayCircle className="w-3.5 h-3.5" />
-            Host Control
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('projector')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-              activeTab === 'projector'
-                ? 'bg-white text-slate-900 shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <Monitor className="w-3.5 h-3.5" />
-            Projector View
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('admin')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-              activeTab === 'admin'
-                ? 'bg-white text-slate-900 shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <Sliders className="w-3.5 h-3.5" />
-            Edit Questions
-          </button>
+        {/* View Switcher Tabs */}
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-md border border-slate-200">
+            <button
+              type="button"
+              onClick={() => setActiveTab('host')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                activeTab === 'host'
+                  ? 'bg-white text-slate-900 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <PlayCircle className="w-3.5 h-3.5" />
+              Host Control
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('projector')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                activeTab === 'projector'
+                  ? 'bg-white text-slate-900 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Monitor className="w-3.5 h-3.5" />
+              Projector View
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('admin')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                activeTab === 'admin'
+                  ? 'bg-white text-slate-900 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              Edit Questions
+            </button>
+          </div>
+
+          {/* Firebase Connection Status & Settings */}
+          <FirebaseSyncStatus isConnected={isFirebaseConnected} />
         </div>
       </nav>
 
@@ -595,6 +644,7 @@ export default function App() {
             onResetGameplay={handleResetGameplay}
             onOpenProjectorWindow={handleOpenProjectorWindow}
             popupBlockedNotice={popupBlockedNotice}
+            isFirebaseConnected={isFirebaseConnected}
           />
         )}
 
@@ -604,6 +654,7 @@ export default function App() {
               config={config}
               state={state}
               onBackToHost={() => setActiveTab('host')}
+              isFirebaseConnected={isFirebaseConnected}
             />
           </div>
         )}
@@ -618,12 +669,13 @@ export default function App() {
         )}
       </main>
 
-      {/* React Portal to separate Projector Window (when open) */}
+      {/* React Portal to separate Projector Window (when open on Desktop) */}
       {projectorMountNode &&
         createPortal(
           <ProjectorView
             config={config}
             state={state}
+            isFirebaseConnected={isFirebaseConnected}
           />,
           projectorMountNode
         )}

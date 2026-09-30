@@ -26,6 +26,8 @@ import {
   Undo2,
 } from 'lucide-react';
 
+import { FirebaseSyncStatus } from './FirebaseSyncStatus';
+
 interface HostControlProps {
   config: GameConfig;
   state: GameState;
@@ -43,6 +45,7 @@ interface HostControlProps {
   onResetGameplay: () => void;
   onOpenProjectorWindow: () => void;
   popupBlockedNotice?: boolean;
+  isFirebaseConnected?: boolean;
 }
 
 export const HostControl: React.FC<HostControlProps> = ({
@@ -62,6 +65,7 @@ export const HostControl: React.FC<HostControlProps> = ({
   onResetGameplay,
   onOpenProjectorWindow,
   popupBlockedNotice,
+  isFirebaseConnected = false,
 }) => {
   const [layoutMode, setLayoutMode] = useState<'focused' | 'split'>('focused');
   const [showResetGameConfirm, setShowResetGameConfirm] = useState(false);
@@ -212,6 +216,9 @@ export const HostControl: React.FC<HostControlProps> = ({
             <Edit3 className="w-3.5 h-3.5" />
             Edit Questions
           </button>
+
+          {/* Firebase Realtime Connection Status */}
+          <FirebaseSyncStatus isConnected={isFirebaseConnected} />
         </div>
       </header>
 

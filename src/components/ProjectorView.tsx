@@ -15,12 +15,14 @@ interface ProjectorViewProps {
   state: GameState;
   onBackToHost?: () => void;
   onExitFullscreen?: () => void;
+  isFirebaseConnected?: boolean;
 }
 
 export const ProjectorView: React.FC<ProjectorViewProps> = ({
   config,
   state,
   onBackToHost,
+  isFirebaseConnected = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -133,6 +135,25 @@ export const ProjectorView: React.FC<ProjectorViewProps> = ({
                 </>
               )}
             </div>
+          </div>
+
+          {/* Realtime Sync Status Indicator */}
+          <div
+            className="flex items-center gap-1.5 px-2 py-1 bg-slate-100 rounded text-[11px] text-slate-500 font-medium"
+            title={
+              isFirebaseConnected
+                ? 'Firebase Realtime: Connected (Live)'
+                : 'Firebase Realtime: Reconnecting / Cached'
+            }
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                isFirebaseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+              }`}
+            />
+            <span className="hidden sm:inline">
+              {isFirebaseConnected ? 'Live' : 'Cached'}
+            </span>
           </div>
 
           {/* Fullscreen Button */}
