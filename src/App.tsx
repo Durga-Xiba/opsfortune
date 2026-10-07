@@ -12,6 +12,7 @@ import {
   saveConfig,
   saveState,
   createFreshState,
+  TOTAL_QUESTIONS,
 } from './utils/gameState';
 import {
   subscribeToGameState,
@@ -35,13 +36,17 @@ export default function App() {
   const [state, setState] = useState<GameState>(getInitialState);
   const [isFirebaseConnected, setIsFirebaseConnected] = useState<boolean>(false);
 
-  // Check URL query param ?view=projector (ideal for Median APK on Projector/LED screen)
+  // Active role/view persistence (preserves Projector View on Android APK reboot)
   const [activeTab, setActiveTab] = useState<'host' | 'projector' | 'admin'>(() => {
     if (typeof window !== 'undefined') {
       try {
         const params = new URLSearchParams(window.location.search);
-        if (params.get('view') === 'projector') {
-          return 'projector';
+        const view = params.get('view');
+        if (view === 'projector') return 'projector';
+        if (view === 'host') return 'host';
+        const saved = localStorage.getItem('ops_fortune_active_role');
+        if (saved === 'projector' || saved === 'host' || saved === 'admin') {
+          return saved;
         }
       } catch {
         // safe
@@ -49,6 +54,17 @@ export default function App() {
     }
     return 'host';
   });
+
+  const handleSelectTab = useCallback((tab: 'host' | 'projector' | 'admin') => {
+    setActiveTab(tab);
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('ops_fortune_active_role', tab);
+      } catch {
+        // safe
+      }
+    }
+  }, []);
 
   const [popupBlockedNotice, setPopupBlockedNotice] = useState<boolean>(false);
 
@@ -62,6 +78,19 @@ export default function App() {
 
   const configRef = useRef<GameConfig>(config);
   configRef.current = config;
+
+  // Sound deduplication set keyed by `${questionIndex}_${checkpoint}` to prevent any duplicate audio
+  const playedSoundsRef = useRef<Set<string>>(new Set());
+
+  // Sync in-memory deduplication set with existing buzzerHistory (e.g. after refresh/crash recovery)
+  useEffect(() => {
+    if (Array.isArray(state.buzzerHistory)) {
+      const qIdx = state.currentQuestionIndex;
+      state.buzzerHistory.forEach((cp) => {
+        playedSoundsRef.current.add(`${qIdx}_${cp}`);
+      });
+    }
+  }, [state.currentQuestionIndex, state.buzzerHistory]);
 
   // Authoritative Host state commit: writes to local storage AND pushes to Firebase Realtime Database
   const commitHostState = useCallback((nextState: GameState) => {
@@ -153,23 +182,39 @@ export default function App() {
 
       const now = Date.now();
       const rawRemaining = Math.max(0, Math.ceil((currentState.timerEndTime - now) / 1000));
+      const qIdx = currentState.currentQuestionIndex;
 
-      const checkpoints = [110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+      // EXACT CHECKPOINTS: 01:50, 01:40, 01:30, 01:20, 01:10, 01:00
+      // STRICTLY NO BUZZER AT 00:50, 00:40, 00:30, 00:20 or 00:10
+      const intermediateCheckpoints = [110, 100, 90, 80, 70, 60];
       const newBuzzerHistory = [...currentState.buzzerHistory];
 
-      // Check 10-second checkpoints
-      for (const cp of checkpoints) {
+      for (const cp of intermediateCheckpoints) {
+        const soundKey = `${qIdx}_${cp}`;
         if (rawRemaining <= cp && !newBuzzerHistory.includes(cp)) {
           newBuzzerHistory.push(cp);
-          soundEngine.play10SecBeep();
+          if (!playedSoundsRef.current.has(soundKey)) {
+            playedSoundsRef.current.add(soundKey);
+            if (cp === 60) {
+              // 7. 01:00 Checkpoint: LONG + MAX VOLUME BUZZER (Participant answer time is OVER)
+              soundEngine.play0100TimeUpBuzzer();
+            } else {
+              // 2-6. 01:50, 01:40, 01:30, 01:20, 01:10 Checkpoints: Medium + HIGH-VOLUME BUZZER
+              soundEngine.playMediumBuzzer();
+            }
+          }
         }
       }
 
-      // Check 00:00 Final Buzzer & Time Up
+      // 8. 00:00 Checkpoint: LONG + MAX VOLUME FINAL BUZZER (Round completely over)
       if (rawRemaining <= 0) {
+        const soundKey0 = `${qIdx}_0`;
         if (!newBuzzerHistory.includes(0)) {
           newBuzzerHistory.push(0);
-          soundEngine.playFinalBuzzer();
+          if (!playedSoundsRef.current.has(soundKey0)) {
+            playedSoundsRef.current.add(soundKey0);
+            soundEngine.playFinalBuzzer();
+          }
         }
 
         const timeUpState: GameState = {
@@ -220,11 +265,22 @@ export default function App() {
 
     const duration = currentState.timerRemaining;
     const nextEndTime = Date.now() + duration * 1000;
+    const newBuzzerHistory = [...currentState.buzzerHistory];
+    const qIdx = currentState.currentQuestionIndex;
+
+    // 1. 02:00 Checkpoint: LONG + MAX VOLUME BUZZER immediately when Host presses START
+    const startKey = `${qIdx}_120`;
+    if (duration >= 119 && !newBuzzerHistory.includes(120) && !playedSoundsRef.current.has(startKey)) {
+      playedSoundsRef.current.add(startKey);
+      newBuzzerHistory.push(120);
+      soundEngine.play0200StartBuzzer();
+    }
 
     const nextState: GameState = {
       ...currentState,
       timerStatus: 'RUNNING',
       timerEndTime: nextEndTime,
+      buzzerHistory: newBuzzerHistory,
       lastUpdated: Date.now(),
     };
 
@@ -254,6 +310,11 @@ export default function App() {
 
   const handleResetTimer = () => {
     const currentState = stateRef.current;
+    // Clear sound deduplication for current question so it can replay when started again
+    for (const cp of [120, 110, 100, 90, 80, 70, 60, 0]) {
+      playedSoundsRef.current.delete(`${currentState.currentQuestionIndex}_${cp}`);
+    }
+
     const nextState: GameState = {
       ...currentState,
       timerStatus: 'IDLE',
@@ -268,8 +329,13 @@ export default function App() {
   };
 
   const handleChangeQuestion = (newIndex: number) => {
-    if (newIndex < 0 || newIndex > 29) return;
+    if (newIndex < 0 || newIndex > TOTAL_QUESTIONS - 1) return;
     const currentState = stateRef.current;
+
+    // Reset sound deduplication for target question
+    for (const cp of [120, 110, 100, 90, 80, 70, 60, 0]) {
+      playedSoundsRef.current.delete(`${newIndex}_${cp}`);
+    }
 
     // Moving question: Reset gameplay scoring for new question, Stop timer, reset to 02:00, clear buzzer history, do not auto-start
     const nextState: GameState = {
@@ -399,6 +465,11 @@ export default function App() {
     const currentState = stateRef.current;
     const qIdx = currentState.currentQuestionIndex;
 
+    // Reset sound deduplication for this question
+    for (const cp of [120, 110, 100, 90, 80, 70, 60, 0]) {
+      playedSoundsRef.current.delete(`${qIdx}_${cp}`);
+    }
+
     const nextState: GameState = {
       ...currentState,
       revealedMap: {
@@ -422,6 +493,7 @@ export default function App() {
   };
 
   const handleResetGameplay = () => {
+    playedSoundsRef.current.clear();
     const fresh = createFreshState();
     commitHostState(fresh);
   };
@@ -433,7 +505,7 @@ export default function App() {
     saveGameConfigToFirebase(newConfig).catch((err) => {
       console.warn('Firebase config write error:', err);
     });
-    setActiveTab('host');
+    handleSelectTab('host');
   };
 
   const handleResetContentToDefaults = () => {
@@ -457,7 +529,7 @@ export default function App() {
     try {
       win.document.title = `${configRef.current.gameName || 'OPS FORTUNE'} · Projector Display`;
       win.document.body.className =
-        'bg-[#F8F9FA] text-[#1E293B] antialiased min-h-screen select-none m-0 p-0 overflow-x-hidden';
+        'bg-[#061229] text-white antialiased min-h-screen select-none m-0 p-0 overflow-hidden';
       win.document.body.innerHTML = '<div id="projector-mount"></div>';
 
       const headNodes = document.querySelectorAll(
@@ -583,7 +655,7 @@ export default function App() {
           <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-md border border-slate-200">
             <button
               type="button"
-              onClick={() => setActiveTab('host')}
+              onClick={() => handleSelectTab('host')}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                 activeTab === 'host'
                   ? 'bg-white text-slate-900 shadow-2xs'
@@ -595,7 +667,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setActiveTab('projector')}
+              onClick={() => handleSelectTab('projector')}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                 activeTab === 'projector'
                   ? 'bg-white text-slate-900 shadow-2xs'
@@ -607,7 +679,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setActiveTab('admin')}
+              onClick={() => handleSelectTab('admin')}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
                 activeTab === 'admin'
                   ? 'bg-white text-slate-900 shadow-2xs'
@@ -640,7 +712,7 @@ export default function App() {
             onPauseTimer={handlePauseTimer}
             onResetTimer={handleResetTimer}
             onChangeQuestion={handleChangeQuestion}
-            onOpenEdit={() => setActiveTab('admin')}
+            onOpenEdit={() => handleSelectTab('admin')}
             onResetGameplay={handleResetGameplay}
             onOpenProjectorWindow={handleOpenProjectorWindow}
             popupBlockedNotice={popupBlockedNotice}
@@ -653,7 +725,7 @@ export default function App() {
             <ProjectorView
               config={config}
               state={state}
-              onBackToHost={() => setActiveTab('host')}
+              onBackToHost={() => handleSelectTab('host')}
               isFirebaseConnected={isFirebaseConnected}
             />
           </div>
@@ -663,7 +735,7 @@ export default function App() {
           <AdminEditor
             initialConfig={config}
             onSave={handleSaveConfig}
-            onCancel={() => setActiveTab('host')}
+            onCancel={() => handleSelectTab('host')}
             onResetToDefaults={handleResetContentToDefaults}
           />
         )}

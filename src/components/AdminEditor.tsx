@@ -92,7 +92,7 @@ export const AdminEditor: React.FC<AdminEditorProps> = ({
               EDIT GAME CONTENT
             </h1>
             <p className="text-xs md:text-sm text-slate-500 mt-0.5">
-              Customize game title, subtitle, and all 30 questions with their 10 answers. Fixed point values (100 to 10) are preserved.
+              Customize game title, subtitle, and all 20 questions with their 10 answers. Fixed point values (100 to 10) are preserved.
             </p>
           </div>
 
@@ -152,11 +152,11 @@ export const AdminEditor: React.FC<AdminEditorProps> = ({
         </div>
       </div>
 
-      {/* 30-Question Compact Navigation Strip */}
+      {/* 20-Question Compact Navigation Strip */}
       <div className="bg-white border border-slate-200 rounded-lg p-4 mb-6 shadow-2xs">
         <div className="flex items-center justify-between gap-2 mb-3">
           <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">
-            Select Question to Edit ({activeQuestionIndex + 1} of 30)
+            Select Question to Edit ({activeQuestionIndex + 1} of 20)
           </span>
 
           <div className="flex items-center gap-1.5">
@@ -171,8 +171,8 @@ export const AdminEditor: React.FC<AdminEditorProps> = ({
             </button>
             <button
               type="button"
-              disabled={activeQuestionIndex === 29}
-              onClick={() => setActiveQuestionIndex((prev) => Math.min(29, prev + 1))}
+              disabled={activeQuestionIndex === 19}
+              onClick={() => setActiveQuestionIndex((prev) => Math.min(19, prev + 1))}
               className="p-1.5 rounded border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
               title="Next Question"
             >
@@ -182,7 +182,7 @@ export const AdminEditor: React.FC<AdminEditorProps> = ({
         </div>
 
         <div className="flex flex-wrap gap-1.5">
-          {config.questions.map((q, idx) => {
+          {config.questions.slice(0, 20).map((q, idx) => {
             const isSelected = idx === activeQuestionIndex;
             return (
               <button

@@ -152,7 +152,7 @@ export const HostControl: React.FC<HostControlProps> = ({
 
           <button
             type="button"
-            disabled={currentQIndex === 29}
+            disabled={currentQIndex === 19}
             onClick={() => onChangeQuestion(currentQIndex + 1)}
             className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-bold text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
           >
@@ -160,8 +160,8 @@ export const HostControl: React.FC<HostControlProps> = ({
             <ChevronRight className="w-4 h-4" />
           </button>
 
-          <span className="text-xs font-bold text-slate-500 uppercase tracking-wider ml-1">
-            Q{currentQIndex + 1} of 30
+          <span className="text-xs font-bold text-amber-600 uppercase tracking-wider ml-1">
+            Q{currentQIndex + 1} of 20
           </span>
         </div>
 
@@ -247,8 +247,8 @@ export const HostControl: React.FC<HostControlProps> = ({
           {/* Question Headline */}
           <div className="text-center md:text-left">
             <div className="flex items-center justify-center md:justify-start gap-2">
-              <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">
-                Question {currentQIndex + 1} of 30
+              <span className="text-xs font-bold text-amber-600 uppercase tracking-widest">
+                Question {currentQIndex + 1} of 20
               </span>
               <span className="text-slate-300">·</span>
               <span className="text-xs font-medium text-slate-500">2-Minute Timed Round</span>
@@ -612,12 +612,12 @@ export const HostControl: React.FC<HostControlProps> = ({
 
       {/* Bottom Global Controls: Quick Question Grid & Game Reset */}
       <footer className="bg-white border border-slate-200 rounded-lg p-4 shadow-2xs flex flex-col md:flex-row items-center justify-between gap-4">
-        {/* Compact 30-Question Jump Bar */}
+        {/* Compact 20-Question Jump Bar */}
         <div className="flex flex-wrap items-center gap-1 max-w-2xl">
           <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mr-1">
             Jump to Question:
           </span>
-          {config.questions.map((q, idx) => {
+          {config.questions.slice(0, 20).map((q, idx) => {
             const isCurrent = idx === currentQIndex;
             const revCount = (state.revealedMap[idx] || []).filter(Boolean).length;
             return (

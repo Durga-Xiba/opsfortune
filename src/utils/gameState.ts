@@ -10,6 +10,8 @@ export const CONFIG_STORAGE_KEY = 'ops_fortune_config_v1';
 export const STATE_STORAGE_KEY = 'ops_fortune_state_v1';
 export const BROADCAST_CHANNEL_NAME = 'ops_fortune_channel_v1';
 
+export const TOTAL_QUESTIONS = 20;
+
 export function getInitialConfig(): GameConfig {
   if (typeof window === 'undefined') {
     return {
@@ -24,9 +26,11 @@ export function getInitialConfig(): GameConfig {
     const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.questions) && parsed.questions.length === 30) {
+      // Migrate safely if array has 20 or more questions
+      if (parsed && Array.isArray(parsed.questions) && parsed.questions.length >= 20) {
+        const sliced = parsed.questions.slice(0, TOTAL_QUESTIONS);
         // Validate each question has 10 answers with locked points
-        const validatedQuestions: GameQuestion[] = parsed.questions.map((q: Partial<GameQuestion>, idx: number) => {
+        const validatedQuestions: GameQuestion[] = sliced.map((q: Partial<GameQuestion>, idx: number) => {
           const fallback = DEFAULT_QUESTIONS[idx] || DEFAULT_QUESTIONS[0];
           const answers = Array.isArray(q.answers) && q.answers.length === 10
             ? q.answers.map((a, aIdx) => ({
@@ -65,7 +69,12 @@ export function getInitialConfig(): GameConfig {
 
 export function saveConfig(config: GameConfig): void {
   try {
-    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    // Ensure only 20 questions are saved
+    const safeConfig: GameConfig = {
+      ...config,
+      questions: config.questions.slice(0, TOTAL_QUESTIONS),
+    };
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(safeConfig));
   } catch (e) {
     console.error('Failed to save config to localStorage', e);
   }
@@ -81,11 +90,11 @@ export function getInitialState(): GameState {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.currentQuestionIndex === 'number') {
-        const qIdx = Math.max(0, Math.min(29, parsed.currentQuestionIndex));
+        const qIdx = Math.max(0, Math.min(TOTAL_QUESTIONS - 1, parsed.currentQuestionIndex));
         const revealedMap: Record<number, boolean[]> = {};
 
         if (parsed.revealedMap && typeof parsed.revealedMap === 'object') {
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < TOTAL_QUESTIONS; i++) {
             if (Array.isArray(parsed.revealedMap[i]) && parsed.revealedMap[i].length === 10) {
               revealedMap[i] = parsed.revealedMap[i].map(Boolean);
             } else {
@@ -93,18 +102,18 @@ export function getInitialState(): GameState {
             }
           }
         } else {
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < TOTAL_QUESTIONS; i++) {
             revealedMap[i] = Array(10).fill(false);
           }
         }
 
         const wrongGuessesMap: Record<number, number> = {};
         if (parsed.wrongGuessesMap && typeof parsed.wrongGuessesMap === 'object') {
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < TOTAL_QUESTIONS; i++) {
             wrongGuessesMap[i] = typeof parsed.wrongGuessesMap[i] === 'number' ? Math.max(0, parsed.wrongGuessesMap[i]) : 0;
           }
         } else {
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < TOTAL_QUESTIONS; i++) {
             wrongGuessesMap[i] = 0;
           }
         }
@@ -149,7 +158,7 @@ export function getInitialState(): GameState {
 export function createFreshState(): GameState {
   const revealedMap: Record<number, boolean[]> = {};
   const wrongGuessesMap: Record<number, number> = {};
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
     revealedMap[i] = Array(10).fill(false);
     wrongGuessesMap[i] = 0;
   }

@@ -13,9 +13,10 @@ import {
   Database,
   Unsubscribe,
 } from 'firebase/database';
-import { getAuth, signInAnonymously } from 'firebase/auth';
 import { GameConfig, GameState, GameQuestion } from '../types/game';
 import { DEFAULT_QUESTIONS, FIXED_POINTS } from '../data/defaultQuestions';
+
+export const TOTAL_QUESTIONS = 20;
 
 export interface FirebaseSyncConfig {
   apiKey?: string;
@@ -29,14 +30,20 @@ export interface FirebaseSyncConfig {
 
 const FIREBASE_CONFIG_STORAGE_KEY = 'ops_fortune_firebase_custom_config_v1';
 
+// Production Firebase Realtime Database configuration (Hardcoded defaults for Android APK & Web)
 export const DEFAULT_FIREBASE_CONFIG: FirebaseSyncConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || 'AIzaSyDemoPlaceholderForRTDB',
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || 'ocxi-0369.firebaseapp.com',
-  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL || 'https://ocxi-0369-default-rtdb.firebaseio.com',
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || 'ocxi-0369',
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || 'ocxi-0369.appspot.com',
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '',
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || '',
+  databaseURL:
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_DATABASE_URL) ||
+    'https://ocxi-0369-default-rtdb.firebaseio.com',
+  projectId:
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_PROJECT_ID) ||
+    'ocxi-0369',
+  authDomain:
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN) ||
+    'ocxi-0369.firebaseapp.com',
+  storageBucket:
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_STORAGE_BUCKET) ||
+    'ocxi-0369.appspot.com',
 };
 
 export function getActiveFirebaseConfig(): FirebaseSyncConfig {
@@ -45,15 +52,19 @@ export function getActiveFirebaseConfig(): FirebaseSyncConfig {
       const stored = localStorage.getItem(FIREBASE_CONFIG_STORAGE_KEY);
       if (stored) {
         const parsed = JSON.parse(stored);
-        if (parsed && typeof parsed.databaseURL === 'string' && parsed.databaseURL.trim()) {
+        if (
+          parsed &&
+          typeof parsed.databaseURL === 'string' &&
+          parsed.databaseURL.startsWith('https://')
+        ) {
           return {
             ...DEFAULT_FIREBASE_CONFIG,
             ...parsed,
           };
         }
       }
-    } catch (e) {
-      console.warn('Failed to parse custom Firebase config from localStorage', e);
+    } catch {
+      // Fallback to production default
     }
   }
   return DEFAULT_FIREBASE_CONFIG;
@@ -63,8 +74,8 @@ export function saveActiveFirebaseConfig(cfg: FirebaseSyncConfig): void {
   if (typeof window !== 'undefined') {
     try {
       localStorage.setItem(FIREBASE_CONFIG_STORAGE_KEY, JSON.stringify(cfg));
-    } catch (e) {
-      console.warn('Failed to save Firebase config to localStorage', e);
+    } catch {
+      // safe
     }
   }
 }
@@ -86,16 +97,6 @@ export function getFirebaseInstance(): { app: FirebaseApp; db: Database } | null
       } else {
         cachedApp = initializeApp(config);
       }
-
-      // Attempt anonymous auth in background if available
-      try {
-        const auth = getAuth(cachedApp);
-        signInAnonymously(auth).catch(() => {
-          // If auth isn't enabled or rules are open, this is harmlessly non-blocking
-        });
-      } catch {
-        // Safe ignore
-      }
     }
 
     if (!cachedDb && cachedApp) {
@@ -107,13 +108,67 @@ export function getFirebaseInstance(): { app: FirebaseApp; db: Database } | null
     }
     return null;
   } catch (err) {
-    console.warn('Failed to initialize Firebase Realtime Database instance:', err);
+    console.warn('Failed to initialize Firebase Realtime Database:', err);
     return null;
   }
 }
 
 /**
- * Validates and sanitizes GameState received from Firebase or storage
+ * Prepares and sanitizes GameState before writing to Firebase Realtime Database.
+ * CRITICAL: Firebase Realtime Database throws an error if ANY property contains undefined.
+ * This function guarantees no undefined values and ensures proper JSON serialization.
+ */
+export function prepareStateForFirebase(state: GameState): Record<string, unknown> {
+  const revealedObj: Record<string, boolean[]> = {};
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+    const row = state.revealedMap?.[i];
+    if (Array.isArray(row) && row.length === 10) {
+      revealedObj[i] = row.map(Boolean);
+    } else {
+      revealedObj[i] = Array(10).fill(false);
+    }
+  }
+
+  const wrongObj: Record<string, number> = {};
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+    const val = state.wrongGuessesMap?.[i];
+    wrongObj[i] = typeof val === 'number' && !isNaN(val) ? Math.max(0, Math.floor(val)) : 0;
+  }
+
+  return {
+    currentQuestionIndex:
+      typeof state.currentQuestionIndex === 'number' && !isNaN(state.currentQuestionIndex)
+        ? Math.max(0, Math.min(TOTAL_QUESTIONS - 1, Math.floor(state.currentQuestionIndex)))
+        : 0,
+    revealedMap: revealedObj,
+    wrongGuessesMap: wrongObj,
+    lastWrongGuessTimestamp:
+      typeof state.lastWrongGuessTimestamp === 'number' && state.lastWrongGuessTimestamp > 0
+        ? state.lastWrongGuessTimestamp
+        : null,
+    timerStatus: state.timerStatus || 'IDLE',
+    timerRemaining:
+      typeof state.timerRemaining === 'number' && !isNaN(state.timerRemaining)
+        ? Math.max(0, Math.min(120, Math.floor(state.timerRemaining)))
+        : 120,
+    timerEndTime:
+      typeof state.timerEndTime === 'number' && !isNaN(state.timerEndTime)
+        ? state.timerEndTime
+        : null,
+    timerPausedAtRemaining:
+      typeof state.timerPausedAtRemaining === 'number' && !isNaN(state.timerPausedAtRemaining)
+        ? Math.max(0, Math.min(120, Math.floor(state.timerPausedAtRemaining)))
+        : 120,
+    buzzerHistory: Array.isArray(state.buzzerHistory)
+      ? state.buzzerHistory.filter((n): n is number => typeof n === 'number' && !isNaN(n))
+      : [],
+    lastUpdated: Date.now(),
+  };
+}
+
+/**
+ * Validates and sanitizes GameState received from Firebase or storage.
+ * Supports both Array and Object representations (since Firebase RTDB converts numeric-key objects to arrays).
  */
 export function sanitizeGameState(raw: unknown, fallbackState?: GameState): GameState {
   if (!raw || typeof raw !== 'object') {
@@ -124,16 +179,22 @@ export function sanitizeGameState(raw: unknown, fallbackState?: GameState): Game
 
   const currentQuestionIndex =
     typeof obj.currentQuestionIndex === 'number' && !isNaN(obj.currentQuestionIndex)
-      ? Math.max(0, Math.min(29, Math.floor(obj.currentQuestionIndex)))
+      ? Math.max(0, Math.min(TOTAL_QUESTIONS - 1, Math.floor(obj.currentQuestionIndex)))
       : fallbackState?.currentQuestionIndex ?? 0;
 
-  // Sanitize revealedMap: ensure all 30 questions have boolean[10]
+  // Sanitize revealedMap: ensure all 20 questions have boolean[10]
   const revealedMap: Record<number, boolean[]> = {};
-  const rawRev = (obj.revealedMap && typeof obj.revealedMap === 'object' ? obj.revealedMap : {}) as Record<string, unknown>;
-  for (let i = 0; i < 30; i++) {
+  const rawRev = (obj.revealedMap && typeof obj.revealedMap === 'object' ? obj.revealedMap : {}) as Record<string | number, unknown>;
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
     const arr = rawRev[i];
     if (Array.isArray(arr) && arr.length === 10) {
       revealedMap[i] = arr.map(Boolean);
+    } else if (Array.isArray(arr) && arr.length > 0) {
+      const padded = Array(10).fill(false);
+      for (let j = 0; j < Math.min(10, arr.length); j++) {
+        padded[j] = Boolean(arr[j]);
+      }
+      revealedMap[i] = padded;
     } else if (fallbackState?.revealedMap?.[i]) {
       revealedMap[i] = [...fallbackState.revealedMap[i]];
     } else {
@@ -141,10 +202,10 @@ export function sanitizeGameState(raw: unknown, fallbackState?: GameState): Game
     }
   }
 
-  // Sanitize wrongGuessesMap: ensure all 30 questions have integer >= 0
+  // Sanitize wrongGuessesMap: ensure all 20 questions have integer >= 0
   const wrongGuessesMap: Record<number, number> = {};
-  const rawWrong = (obj.wrongGuessesMap && typeof obj.wrongGuessesMap === 'object' ? obj.wrongGuessesMap : {}) as Record<string, unknown>;
-  for (let i = 0; i < 30; i++) {
+  const rawWrong = (obj.wrongGuessesMap && typeof obj.wrongGuessesMap === 'object' ? obj.wrongGuessesMap : {}) as Record<string | number, unknown>;
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
     const val = rawWrong[i];
     if (typeof val === 'number' && !isNaN(val)) {
       wrongGuessesMap[i] = Math.max(0, Math.floor(val));
@@ -193,7 +254,7 @@ export function sanitizeGameState(raw: unknown, fallbackState?: GameState): Game
     : [];
 
   const lastWrongGuessTimestamp =
-    typeof obj.lastWrongGuessTimestamp === 'number' && !isNaN(obj.lastWrongGuessTimestamp)
+    typeof obj.lastWrongGuessTimestamp === 'number' && obj.lastWrongGuessTimestamp > 0
       ? obj.lastWrongGuessTimestamp
       : undefined;
 
@@ -219,7 +280,7 @@ export function sanitizeGameState(raw: unknown, fallbackState?: GameState): Game
 export function createDefaultGameState(): GameState {
   const revealedMap: Record<number, boolean[]> = {};
   const wrongGuessesMap: Record<number, number> = {};
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < TOTAL_QUESTIONS; i++) {
     revealedMap[i] = Array(10).fill(false);
     wrongGuessesMap[i] = 0;
   }
@@ -238,7 +299,7 @@ export function createDefaultGameState(): GameState {
 }
 
 /**
- * Validates and sanitizes GameConfig
+ * Validates and sanitizes GameConfig for 20 questions
  */
 export function sanitizeGameConfig(raw: unknown, fallback?: GameConfig): GameConfig {
   if (!raw || typeof raw !== 'object') {
@@ -247,7 +308,7 @@ export function sanitizeGameConfig(raw: unknown, fallback?: GameConfig): GameCon
         gameName: 'OPS FORTUNE',
         subtitle: 'Connect. Decode. Score.',
         defaultTimerSeconds: 120,
-        questions: DEFAULT_QUESTIONS,
+        questions: DEFAULT_QUESTIONS.slice(0, TOTAL_QUESTIONS),
       }
     );
   }
@@ -262,9 +323,9 @@ export function sanitizeGameConfig(raw: unknown, fallback?: GameConfig): GameCon
       ? obj.subtitle.trim()
       : 'Connect. Decode. Score.';
 
-  let questions: GameQuestion[] = DEFAULT_QUESTIONS;
-  if (Array.isArray(obj.questions) && obj.questions.length === 30) {
-    questions = obj.questions.map((q: Partial<GameQuestion>, idx: number) => {
+  let questions: GameQuestion[] = DEFAULT_QUESTIONS.slice(0, TOTAL_QUESTIONS);
+  if (Array.isArray(obj.questions) && obj.questions.length >= TOTAL_QUESTIONS) {
+    questions = obj.questions.slice(0, TOTAL_QUESTIONS).map((q: Partial<GameQuestion>, idx: number) => {
       const def = DEFAULT_QUESTIONS[idx] || DEFAULT_QUESTIONS[0];
       const answers = Array.isArray(q.answers) && q.answers.length === 10
         ? q.answers.map((a, aIdx) => ({
@@ -298,7 +359,7 @@ const CONFIG_PATH = 'opsFortune/config';
 
 /**
  * Subscribes to /opsFortune/liveState in Firebase Realtime Database.
- * Runs onValue listener for instant WebSocket synchronization across Median APK instances.
+ * Runs onValue listener for instant WebSocket synchronization across Median APK / Web instances.
  */
 export function subscribeToGameState(
   onUpdate: (state: GameState) => void,
@@ -383,7 +444,8 @@ export function subscribeToConnectionHealth(onHealthChange: (connected: boolean)
 }
 
 /**
- * Saves game state authoritatively to Firebase Realtime Database
+ * Saves game state authoritatively to Firebase Realtime Database.
+ * Uses prepareStateForFirebase to ensure no undefined values are written.
  */
 export async function saveGameStateToFirebase(state: GameState): Promise<void> {
   const instance = getFirebaseInstance();
@@ -392,10 +454,8 @@ export async function saveGameStateToFirebase(state: GameState): Promise<void> {
   }
 
   const stateRef = ref(instance.db, LIVE_STATE_PATH);
-  await set(stateRef, {
-    ...state,
-    lastUpdated: Date.now(),
-  });
+  const payload = prepareStateForFirebase(state);
+  await set(stateRef, payload);
 }
 
 /**
